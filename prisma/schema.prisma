@@ -1,0 +1,46 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  // "postgresql" for Vercel (Neon free tier), "sqlite" for local dev
+  //   Local:  DATABASE_URL=file:./dev.db  + change provider to "sqlite"
+  //   Prod:   DATABASE_URL=postgres://...  (set in Vercel dashboard)
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model LeaderboardEntry {
+  id              String   @id @default(cuid())
+  wallet          String   @unique
+  signatureHash   String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  balance         Float    @default(0)
+  simulatedScore  Float    @default(50)
+  simulatedWeight Float    @default(0)
+  ogFlag          Boolean  @default(false)
+  displayName     String?
+
+  @@index([simulatedWeight(sort: Desc)])
+  @@index([wallet])
+}
+
+/// Caches NFT activity timestamps discovered via RPC.
+/// Avoids re-fetching the same signature data on every page load.
+model NftActivity {
+  /// Composite key: wallet + mint
+  id            String   @id @default(cuid())
+  wallet        String
+  mint          String
+  name          String   @default("")
+  image         String   @default("")
+  held          Boolean  @default(true)
+  lastActivityTs  Int?
+  lastActivitySig String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([wallet, mint])
+  @@index([wallet])
+}
