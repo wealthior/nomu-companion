@@ -8,6 +8,9 @@ export const NOMU_MINT = "NomuBwKJEvJ8d4dsaq7NZoHaXWXzKcfke1c7Y8ruFYL";
  */
 export const NOMU_OG_NFT_COLLECTION_NAME = "nomu";
 
+/** Metaplex Certified Collection address for Nomu OG NFTs (used by Helius DAS searchAssets) */
+export const NOMU_OG_COLLECTION_ADDRESS = "DsNoUoX6txsJkrsg1hnKA5CpCi575Tw13YgbqiYUzzvU";
+
 /**
  * NFT name patterns to EXCLUDE from OG detection.
  * E.g. "NOMU Liquidity Provider" NFTs are not OG NFTs.

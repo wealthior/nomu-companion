@@ -1,4 +1,6 @@
-import { NOMU_MINT } from "@/lib/constants";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { NOMU_MINT, NOMU_OG_COLLECTION_ADDRESS } from "@/lib/constants";
 import type { DataAdapter, TokenEvent, OgNftInfo } from "@/lib/types";
 import { createRpcAdapter } from "./rpc-adapter";
 
@@ -38,15 +40,27 @@ interface HeliusAsset {
 
 /**
  * Helius adapter for enriched transaction data and NFT detection.
- * Falls back to RPC adapter for balance queries.
+ *
+ * Key advantage over the free RPC adapter:
+ * - ALL Solana RPC calls go through Helius RPC (generous per-key rate limits)
+ * - No 429 cascade — activity timestamps for 20+ NFTs in one pass
+ * - DAS API (getAssetsByOwner) returns NFT metadata + images in 1 call
+ * - Helius Enhanced Transactions API for enriched swap detection
  */
 export function createHeliusAdapter(
   apiKey: string,
-  rpcUrl: string
+  _rpcUrl: string
 ): DataAdapter {
-  const rpcAdapter = createRpcAdapter(rpcUrl);
+  // Route ALL RPC calls through Helius (no public-RPC IP rate limit)
+  const heliusRpcUrl = `https://mainnet.helius-rpc.com/?api-key=${apiKey}`;
+  const rpcAdapter = createRpcAdapter(heliusRpcUrl);
   const baseUrl = `https://api.helius.xyz/v0`;
-  const rpcBaseUrl = `https://mainnet.helius-rpc.com/?api-key=${apiKey}`;
+
+  // Helius RPC connection for NFT signature lookups
+  const connection = new Connection(heliusRpcUrl, {
+    commitment: "confirmed",
+    disableRetryOnRateLimit: true,
+  });
 
   return {
     async getBalance(wallet: string): Promise<number> {
@@ -134,17 +148,26 @@ export function createHeliusAdapter(
       return events;
     },
 
+    /**
+     * Fetches OG NFTs using Helius DAS searchAssets (by collection) + activity timestamps.
+     *
+     * 1. searchAssets with collection filter → all NOMU OG NFTs (1 call, no pagination issues)
+     * 2. getSignaturesForAddress per NFT ATA → activity timestamps (parallel batches)
+     *
+     * With Helius RPC, all 20+ signature lookups complete without 429s.
+     */
     async getOgNfts(wallet: string): Promise<OgNftInfo[]> {
       try {
-        const response = await fetch(rpcBaseUrl, {
+        const response = await fetch(heliusRpcUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             jsonrpc: "2.0",
-            id: "og-nft-check",
-            method: "getAssetsByOwner",
+            id: "og-nft-search",
+            method: "searchAssets",
             params: {
               ownerAddress: wallet,
+              grouping: ["collection", NOMU_OG_COLLECTION_ADDRESS],
               page: 1,
               limit: 100,
             },
@@ -156,27 +179,60 @@ export function createHeliusAdapter(
         const data = await response.json();
         const assets: HeliusAsset[] = data.result?.items ?? [];
 
-        // Filter for NFTs that look like Nomu OG NFTs
-        // We check for "nomu" in the name (case-insensitive) or known collection
-        return assets
-          .filter((asset) => {
-            const name = asset.content?.metadata?.name?.toLowerCase() ?? "";
-            const isNomuRelated =
-              name.includes("nomu") && (name.includes("og") || name.includes("genesis"));
-            return isNomuRelated;
-          })
-          .map((asset) => ({
-            mint: asset.id,
-            name: asset.content?.metadata?.name ?? "Unknown",
-            image:
-              asset.content?.links?.image ??
-              asset.content?.files?.[0]?.uri ??
-              "",
-            held: true, // Helius getAssetsByOwner only returns currently-held assets
-            lastActivityTs: null,
-            lastActivitySig: null,
-          }));
-      } catch {
+        const ogNfts: OgNftInfo[] = assets.map((asset) => ({
+          mint: asset.id,
+          name: asset.content?.metadata?.name ?? "Unknown",
+          image:
+            asset.content?.links?.image ??
+            asset.content?.files?.[0]?.uri ??
+            "",
+          held: true,
+          lastActivityTs: null,
+          lastActivitySig: null,
+        }));
+
+        if (ogNfts.length === 0) return [];
+
+        // Fetch activity timestamps via Helius RPC — parallel batches of 5
+        // Helius has generous per-key limits, no 429 cascade like public RPC
+        const owner = new PublicKey(wallet);
+        const SIG_BATCH_SIZE = 5;
+
+        for (let i = 0; i < ogNfts.length; i += SIG_BATCH_SIZE) {
+          const batch = ogNfts.slice(i, i + SIG_BATCH_SIZE);
+
+          await Promise.allSettled(
+            batch.map(async (nft) => {
+              try {
+                const nftMint = new PublicKey(nft.mint);
+                const nftAta = getAssociatedTokenAddressSync(nftMint, owner);
+                const sigs = await connection.getSignaturesForAddress(nftAta, {
+                  limit: 1,
+                });
+                if (sigs.length > 0 && sigs[0].blockTime) {
+                  nft.lastActivityTs = sigs[0].blockTime;
+                  nft.lastActivitySig = sigs[0].signature;
+                }
+              } catch {
+                // Skip — activity data is best-effort
+              }
+            })
+          );
+        }
+
+        const successCount = ogNfts.filter(
+          (n) => n.lastActivityTs != null
+        ).length;
+        console.log(
+          `[helius-adapter] ${successCount}/${ogNfts.length} NFT activity timestamps fetched`
+        );
+
+        return ogNfts;
+      } catch (err) {
+        console.warn(
+          `[helius-adapter] getOgNfts failed:`,
+          err instanceof Error ? err.message : err
+        );
         return [];
       }
     },
